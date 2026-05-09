@@ -8,6 +8,7 @@ from torchvision.utils import save_image, make_grid
 from diffusers import DDPMScheduler
 import sys
 import argparse
+import random
 
 # Add 'file' directory to path to import evaluator
 sys.path.append('./file')
@@ -22,7 +23,7 @@ class Trainer:
         
         # 1. Dataset & Dataloader
         full_dataset = ICLEVRDataset(args.img_dir, args.train_path, args.objects_path)
-        val_size = int(len(full_dataset) * args.eval_ratio)
+        val_size = int(len(full_dataset) * 0.01) # 用 1% 驗證即可
         train_size = len(full_dataset) - val_size
         self.train_dataset, self.val_dataset = torch.utils.data.random_split(
             full_dataset, [train_size, val_size],
@@ -30,18 +31,19 @@ class Trainer:
         )
         
         self.train_loader = DataLoader(self.train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-        # 建立一個可以用來取樣驗證條件的 list
         self.val_conditions = torch.stack([self.val_dataset[i][1] for i in range(min(len(self.val_dataset), 64))]).to(self.device)
         
-        # 2. Model, Noise Scheduler & Optimizer
+        # 2. Model, Noise Scheduler, Optimizer & Scheduler
         self.model = ConditionalUnet(num_classes=24).to(self.device)
         self.noise_scheduler = DDPMScheduler(num_train_timesteps=args.timesteps, beta_schedule='squaredcos_cap_v2')
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
+        
+        # 加入 Cosine Annealing 學習率調整
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.epochs)
+        
         self.criterion = nn.MSELoss()
         
         # 3. Evaluator
-        # Note: evaluation_model internally loads './checkpoint.pth' hardcoded.
-        # We'll check if it exists in the current directory, if not, we'll look in ./file/
         if not os.path.exists('checkpoint.pth'):
             if os.path.exists('file/checkpoint.pth'):
                 import shutil
@@ -50,9 +52,9 @@ class Trainer:
         
         self.evaluator = evaluation_model()
         
-        if args.test_only:
-            self.test_cond = get_test_conditions(args.test_path, args.objects_path).to(self.device)
-            self.new_test_cond = get_test_conditions(args.new_test_path, args.objects_path).to(self.device)
+        # 4. Test conditions
+        self.test_cond = get_test_conditions(args.test_path, args.objects_path).to(self.device)
+        self.new_test_cond = get_test_conditions(args.new_test_path, args.objects_path).to(self.device)
         
         if not os.path.exists(args.ckpt_dir):
             os.makedirs(args.ckpt_dir)
@@ -71,14 +73,14 @@ class Trainer:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 
-                # Sample noise
+                # CFG 訓練: 10% 機率將標籤設為全零
+                if random.random() < 0.1:
+                    labels = torch.zeros_like(labels)
+                
                 noise = torch.randn_like(images)
                 timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (images.shape[0],), device=self.device).long()
                 
-                # Add noise to images
                 noisy_images = self.noise_scheduler.add_noise(images, noise, timesteps)
-                
-                # Predict noise
                 noise_pred = self.model(noisy_images, timesteps, labels)
                 
                 loss = self.criterion(noise_pred, noise)
@@ -88,14 +90,16 @@ class Trainer:
                 self.optimizer.step()
                 
                 total_loss += loss.item()
-                pbar.set_postfix(loss=loss.item())
+                pbar.set_postfix(loss=loss.item(), lr=self.optimizer.param_groups[0]['lr'])
+            
+            # 更新學習率
+            self.lr_scheduler.step()
             
             avg_loss = total_loss / len(self.train_loader)
             print(f"Epoch {epoch} finished. Avg Loss: {avg_loss:.6f}")
             
             # Validation
             if (epoch + 1) % self.args.eval_interval == 0:
-                # 抽樣 64 筆以節省時間
                 val_acc = self.evaluate(self.val_conditions, f"val_epoch_{epoch}")
                 print(f"Validation Accuracy (Split Val Set): {val_acc:.4f}")
                 
@@ -110,14 +114,11 @@ class Trainer:
     @torch.no_grad()
     def evaluate(self, conditions, prefix):
         self.model.eval()
-        # Generate images from conditions
-        images = self.sample(conditions)
+        # 使用 CFG 進行採樣，預設 guidance_scale 為 3.0
+        images = self.sample(conditions, guidance_scale=self.args.guidance_scale)
         
-        # Use evaluator to compute accuracy
-        # Images are already normalized in [-1, 1] from sampling logic
         acc = self.evaluator.eval(images, conditions)
         
-        # Save grid
         grid = make_grid(images, nrow=8, normalize=True, value_range=(-1, 1))
         save_path = os.path.join(self.args.save_dir, f"{prefix}.png")
         save_image(grid, save_path)
@@ -125,20 +126,30 @@ class Trainer:
         return acc
 
     @torch.no_grad()
-    def sample(self, conditions):
+    def sample(self, conditions, guidance_scale=3.0):
         self.model.eval()
         batch_size = conditions.shape[0]
-        # Start from pure noise
         shape = (batch_size, 3, 64, 64)
         images = torch.randn(shape, device=self.device)
         
-        # Reverse process
+        # CFG 需要無條件的標籤
+        uncond_conditions = torch.zeros_like(conditions).to(self.device)
+        
         for t in tqdm(self.noise_scheduler.timesteps, desc="Sampling", leave=False):
-            # 1. Predict noise residual
-            model_output = self.model(images, t, conditions)
+            # 為了效率，合併 cond 和 uncond 的 Batch
+            batched_images = torch.cat([images] * 2)
+            batched_timesteps = torch.stack([t] * 2).to(self.device)
+            batched_conditions = torch.cat([conditions, uncond_conditions])
             
-            # 2. Compute previous noisy sample x_t -> x_t-1
-            images = self.noise_scheduler.step(model_output, t, images).prev_sample
+            # 預測雜訊
+            noise_pred_all = self.model(batched_images, batched_timesteps, batched_conditions)
+            noise_pred_cond, noise_pred_uncond = noise_pred_all.chunk(2)
+            
+            # 進行 Classifier-Free Guidance 加強
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            
+            # 更新圖片
+            images = self.noise_scheduler.step(noise_pred, t, images).prev_sample
             
         return images
 
@@ -147,22 +158,20 @@ class Trainer:
         torch.save(self.model.state_dict(), ckpt_path)
 
     def generate_final_results(self, ckpt_path):
-        # Load best model
         self.model.load_state_dict(torch.load(ckpt_path))
         print(f"Loaded checkpoint from {ckpt_path}")
         
-        print("Generating results for test.json...")
+        print(f"Generating results with guidance_scale={self.args.guidance_scale}...")
         test_acc = self.evaluate(self.test_cond, "final_test")
         print(f"Final Test Accuracy: {test_acc:.4f}")
         
-        print("Generating results for new_test.json...")
         new_test_acc = self.evaluate(self.new_test_cond, "final_new_test")
         print(f"Final New Test Accuracy: {new_test_acc:.4f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Path arguments
-    parser.add_argument('--img_dir',        type=str, default="./iclevr", help='Directory with all the images.')
+    parser.add_argument('--img_dir',        type=str, default="./iclevr")
     parser.add_argument('--train_path',     type=str, default="./file/train.json")
     parser.add_argument('--test_path',      type=str, default="./file/test.json")
     parser.add_argument('--new_test_path',  type=str, default="./file/new_test.json")
@@ -177,9 +186,9 @@ if __name__ == "__main__":
     parser.add_argument('--lr',             type=float, default=1e-4)
     parser.add_argument('--timesteps',      type=int, default=1000)
     parser.add_argument('--num_workers',    type=int, default=4)
-    parser.add_argument('--eval_ratio',     type=float, default=0.01)
     parser.add_argument('--eval_interval',  type=int, default=5)
     parser.add_argument('--save_interval',  type=int, default=20)
+    parser.add_argument('--guidance_scale', type=float, default=3.0, help='CFG guidance scale')
     
     # Mode
     parser.add_argument('--test_only',      action='store_true')
