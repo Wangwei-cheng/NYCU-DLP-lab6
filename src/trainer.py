@@ -138,7 +138,7 @@ class Trainer:
         for t in tqdm(self.noise_scheduler.timesteps, desc="Sampling", leave=False):
             # 為了效率，合併 cond 和 uncond 的 Batch
             batched_images = torch.cat([images] * 2)
-            batched_timesteps = torch.stack([t] * 2).to(self.device)
+            batched_timesteps = torch.full((batched_images.shape[0],), t, device=self.device, dtype=torch.long)
             batched_conditions = torch.cat([conditions, uncond_conditions])
             
             # 預測雜訊
