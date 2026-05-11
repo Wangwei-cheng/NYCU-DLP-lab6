@@ -62,3 +62,17 @@ def get_test_conditions(test_path, objects_path):
         conditions.append(multi_hot)
     
     return torch.stack(conditions)
+
+def get_denoising_condition(objects_path):
+    with open(objects_path, 'r') as f:
+        objects = json.load(f)
+
+    num_classes = len(objects)
+    multi_hot = torch.zeros(num_classes)
+    denoising_labels = ["red sphere", "cyan cylinder", "cyan cube"]
+
+    for label in denoising_labels:
+        index = objects[label]
+        multi_hot[index] = 1
+
+    return multi_hot.unsqueeze(0)

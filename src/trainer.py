@@ -9,7 +9,7 @@ import argparse
 import random
 
 from evaluator import evaluation_model
-from dataset import ICLEVRDataset, get_test_conditions
+from dataset import ICLEVRDataset, get_test_conditions, get_denoising_condition
 from model import ConditionalUnet
 
 class Trainer:
@@ -18,24 +18,37 @@ class Trainer:
         self.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
         
         # Dataloader
-        full_dataset = ICLEVRDataset(args.img_dir, args.train_path, args.objects_path)
-        val_size = int(len(full_dataset) * 0.01)
-        train_size = len(full_dataset) - val_size
+        self.full_dataset = ICLEVRDataset(args.img_dir, args.train_path, args.objects_path)
+        val_size = int(len(self.full_dataset) * 0.01)
+        train_size = len(self.full_dataset) - val_size
         self.train_dataset, self.val_dataset = torch.utils.data.random_split(
-            full_dataset, [train_size, val_size],
+            self.full_dataset, [train_size, val_size],
             generator=torch.Generator().manual_seed(42)
         )
         
-        self.train_loader = DataLoader(self.train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-        self.val_conditions = torch.stack([self.val_dataset[i][1] for i in range(min(len(self.val_dataset), 64))]).to(self.device)
+        self.train_loader = DataLoader(
+            self.train_dataset, 
+            batch_size=args.batch_size, 
+            shuffle=True, 
+            num_workers=args.num_workers
+        )
+        self.val_conditions = torch.stack(
+            [self.val_dataset[i][1] for i in range(min(len(self.val_dataset), 64))]
+        ).to(self.device)
         
         # Model, Noise Scheduler, Optimizer & Scheduler
         self.model = ConditionalUnet(num_classes=24).to(self.device)
-        self.noise_scheduler = DDPMScheduler(num_train_timesteps=args.timesteps, beta_schedule='squaredcos_cap_v2')
+        self.noise_scheduler = DDPMScheduler(
+            num_train_timesteps=args.timesteps,
+            beta_schedule='squaredcos_cap_v2'
+        )
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
         
         # Cosine Annealing
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.epochs)
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=args.epochs
+        )
         
         self.criterion = nn.MSELoss()
         
@@ -44,8 +57,19 @@ class Trainer:
         
         # Test conditions
         if self.args.test_only:
-            self.test_cond = get_test_conditions(args.test_path, args.objects_path).to(self.device)
-            self.new_test_cond = get_test_conditions(args.new_test_path, args.objects_path).to(self.device)
+            self.test_cond = get_test_conditions(
+                args.test_path, 
+                args.objects_path
+            ).to(self.device)
+            self.new_test_cond = get_test_conditions(
+                args.new_test_path, 
+                args.objects_path
+            ).to(self.device)
+
+        if self.args.denoising_process:
+            self.denoising_cond = get_denoising_condition(
+                args.objects_path
+            ).to(self.device)
         
         if not os.path.exists(args.ckpt_dir):
             os.makedirs(args.ckpt_dir)
@@ -125,6 +149,9 @@ class Trainer:
         batch_size = conditions.shape[0]
         shape = (batch_size, 3, 64, 64)
         images = torch.randn(shape, device=self.device)
+
+        if self.args.denoising_process:
+            denoising_images = [images]
         
         # CFG 需要無條件的標籤
         uncond_conditions = torch.zeros_like(conditions).to(self.device)
@@ -144,6 +171,14 @@ class Trainer:
             
             # 更新圖片
             images = self.noise_scheduler.step(noise_pred, t, images).prev_sample
+
+            if self.args.denoising_process and t % 100 == 0:
+                denoising_images.append(images[0].cpu())
+
+        if self.args.denoising_process:
+            grid = make_grid(denoising_images, nrow=11, normalize=True, value_range=(-1, 1))
+            save_path = os.path.join(self.args.save_dir, f"denoising_process.png")
+            save_image(grid, save_path)
             
         return images
 
@@ -161,6 +196,12 @@ class Trainer:
         
         new_test_acc = self.evaluate(self.new_test_cond, "Final_new_test", "new_test")
         print(f"Final New Test Accuracy: {new_test_acc:.4f}")
+
+    def generate_denoising_process(self, ckpt_path):
+        self.model.load_state_dict(torch.load(ckpt_path))
+        print(f"Loaded checkpoint from {ckpt_path}")
+
+        self.sample(self.denoising_cond, guidance_scale=self.args.guidance_scale)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -185,7 +226,8 @@ if __name__ == "__main__":
     parser.add_argument('--guidance_scale', type=float, default=3.0, help='CFG guidance scale')
     
     # Testing arguments
-    parser.add_argument('--test_only',      action='store_true')
+    parser.add_argument('--test_only',          action='store_true')
+    parser.add_argument('--denoising_process',  action='store_true')
     parser.add_argument('--load_ckpt',      type=str, default=None)
     
     args = parser.parse_args()
@@ -197,5 +239,10 @@ if __name__ == "__main__":
             trainer.generate_final_results(args.load_ckpt)
         else:
             print("Error: Please provide --load_ckpt for test_only mode.")
+    elif args.denoising_process:
+        if args.load_ckpt:
+            trainer.generate_denoising_process(args.load_ckpt)
+        else:
+            print("Error: Please provide --load_ckpt for denoising_process mode.")
     else:
         trainer.train()
