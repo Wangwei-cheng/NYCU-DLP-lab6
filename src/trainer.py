@@ -3,15 +3,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import json
 from torchvision.utils import save_image, make_grid
 from diffusers import DDPMScheduler
-import sys
 import argparse
 import random
 
-# Add 'file' directory to path to import evaluator
-sys.path.append('./file')
 from evaluator import evaluation_model
 from dataset import ICLEVRDataset, get_test_conditions
 from model import ConditionalUnet
@@ -21,9 +17,9 @@ class Trainer:
         self.args = args
         self.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
         
-        # 1. Dataset & Dataloader
+        # Dataloader
         full_dataset = ICLEVRDataset(args.img_dir, args.train_path, args.objects_path)
-        val_size = int(len(full_dataset) * 0.01) # 用 1% 驗證即可
+        val_size = int(len(full_dataset) * 0.01)
         train_size = len(full_dataset) - val_size
         self.train_dataset, self.val_dataset = torch.utils.data.random_split(
             full_dataset, [train_size, val_size],
@@ -33,28 +29,23 @@ class Trainer:
         self.train_loader = DataLoader(self.train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
         self.val_conditions = torch.stack([self.val_dataset[i][1] for i in range(min(len(self.val_dataset), 64))]).to(self.device)
         
-        # 2. Model, Noise Scheduler, Optimizer & Scheduler
+        # Model, Noise Scheduler, Optimizer & Scheduler
         self.model = ConditionalUnet(num_classes=24).to(self.device)
         self.noise_scheduler = DDPMScheduler(num_train_timesteps=args.timesteps, beta_schedule='squaredcos_cap_v2')
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
         
-        # 加入 Cosine Annealing 學習率調整
+        # Cosine Annealing
         self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.epochs)
         
         self.criterion = nn.MSELoss()
         
-        # 3. Evaluator
-        if not os.path.exists('checkpoint.pth'):
-            if os.path.exists('file/checkpoint.pth'):
-                import shutil
-                shutil.copy('file/checkpoint.pth', 'checkpoint.pth')
-                print("Copied file/checkpoint.pth to root for evaluator.")
-        
+        # Evaluator
         self.evaluator = evaluation_model()
         
-        # 4. Test conditions
-        self.test_cond = get_test_conditions(args.test_path, args.objects_path).to(self.device)
-        self.new_test_cond = get_test_conditions(args.new_test_path, args.objects_path).to(self.device)
+        # Test conditions
+        if self.args.test_only:
+            self.test_cond = get_test_conditions(args.test_path, args.objects_path).to(self.device)
+            self.new_test_cond = get_test_conditions(args.new_test_path, args.objects_path).to(self.device)
         
         if not os.path.exists(args.ckpt_dir):
             os.makedirs(args.ckpt_dir)
@@ -92,7 +83,6 @@ class Trainer:
                 total_loss += loss.item()
                 pbar.set_postfix(loss=loss.item(), lr=self.optimizer.param_groups[0]['lr'])
             
-            # 更新學習率
             self.lr_scheduler.step()
             
             avg_loss = total_loss / len(self.train_loader)
@@ -100,8 +90,8 @@ class Trainer:
             
             # Validation
             if (epoch + 1) % self.args.eval_interval == 0:
-                val_acc = self.evaluate(self.val_conditions, f"val_epoch_{epoch}")
-                print(f"Validation Accuracy (Split Val Set): {val_acc:.4f}")
+                val_acc = self.evaluate(self.val_conditions, f"epoch_{epoch}", "val")
+                print(f"Validation Accuracy: {val_acc:.4f}")
                 
                 if val_acc > best_acc:
                     best_acc = val_acc
@@ -112,17 +102,21 @@ class Trainer:
                 self.save_checkpoint(f"epoch_{epoch}.pth")
 
     @torch.no_grad()
-    def evaluate(self, conditions, prefix):
+    def evaluate(self, conditions, prefix, dataset_name):
         self.model.eval()
         # 使用 CFG 進行採樣，預設 guidance_scale 為 3.0
         images = self.sample(conditions, guidance_scale=self.args.guidance_scale)
-        
         acc = self.evaluator.eval(images, conditions)
-        
+
+        if self.args.test_only:
+            for i, image in enumerate(images):
+                os.makedirs(os.path.join(self.args.save_dir, dataset_name), exist_ok=True)
+                save_image(image, os.path.join(self.args.save_dir, dataset_name, f"{i}.png"), normalize=True, value_range=(-1, 1))
+            
         grid = make_grid(images, nrow=8, normalize=True, value_range=(-1, 1))
-        save_path = os.path.join(self.args.save_dir, f"{prefix}.png")
+        save_path = os.path.join(self.args.save_dir, f"{prefix}_grid.png")
         save_image(grid, save_path)
-        
+
         return acc
 
     @torch.no_grad()
@@ -162,10 +156,10 @@ class Trainer:
         print(f"Loaded checkpoint from {ckpt_path}")
         
         print(f"Generating results with guidance_scale={self.args.guidance_scale}...")
-        test_acc = self.evaluate(self.test_cond, "final_test")
+        test_acc = self.evaluate(self.test_cond, "Final_test", "test")
         print(f"Final Test Accuracy: {test_acc:.4f}")
         
-        new_test_acc = self.evaluate(self.new_test_cond, "final_new_test")
+        new_test_acc = self.evaluate(self.new_test_cond, "Final_new_test", "new_test")
         print(f"Final New Test Accuracy: {new_test_acc:.4f}")
 
 if __name__ == "__main__":
@@ -177,7 +171,7 @@ if __name__ == "__main__":
     parser.add_argument('--new_test_path',  type=str, default="./file/new_test.json")
     parser.add_argument('--objects_path',   type=str, default="./file/objects.json")
     parser.add_argument('--ckpt_dir',       type=str, default="./checkpoints")
-    parser.add_argument('--save_dir',       type=str, default="./results")
+    parser.add_argument('--save_dir',       type=str, default="./images")
     
     # Training arguments
     parser.add_argument('--device',         type=str, default="cuda")
@@ -190,7 +184,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_interval',  type=int, default=20)
     parser.add_argument('--guidance_scale', type=float, default=3.0, help='CFG guidance scale')
     
-    # Mode
+    # Testing arguments
     parser.add_argument('--test_only',      action='store_true')
     parser.add_argument('--load_ckpt',      type=str, default=None)
     

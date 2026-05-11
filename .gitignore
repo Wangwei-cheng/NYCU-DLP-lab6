@@ -23,7 +23,7 @@ wheels/
 
 # PyTorch / Deep Learning
 checkpoints/
-results/
+images/
 checkpoint.pth
 
 # Dataset (as per spec: "Please do not upload dataset")
