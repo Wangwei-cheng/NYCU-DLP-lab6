@@ -88,14 +88,23 @@ class Trainer:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 
-                # CFG 訓練: 10% 機率將標籤設為全零
+                # CFG: 10% 機率將標籤設為全零
                 if random.random() < 0.1:
                     labels = torch.zeros_like(labels)
                 
                 noise = torch.randn_like(images)
-                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (images.shape[0],), device=self.device).long()
+                timesteps = torch.randint(
+                    0, 
+                    self.noise_scheduler.config.num_train_timesteps, 
+                    (images.shape[0],), 
+                    device=self.device
+                ).long()
                 
-                noisy_images = self.noise_scheduler.add_noise(images, noise, timesteps)
+                noisy_images = self.noise_scheduler.add_noise(
+                    images, 
+                    noise, 
+                    timesteps
+                )
                 noise_pred = self.model(noisy_images, timesteps, labels)
                 
                 loss = self.criterion(noise_pred, noise)
@@ -105,7 +114,10 @@ class Trainer:
                 self.optimizer.step()
                 
                 total_loss += loss.item()
-                pbar.set_postfix(loss=loss.item(), lr=self.optimizer.param_groups[0]['lr'])
+                pbar.set_postfix(
+                    loss=loss.item(), 
+                    lr=self.optimizer.param_groups[0]['lr']
+                )
             
             self.lr_scheduler.step()
             
@@ -114,7 +126,11 @@ class Trainer:
             
             # Validation
             if (epoch + 1) % self.args.eval_interval == 0:
-                val_acc = self.evaluate(self.val_conditions, f"epoch_{epoch}", "val")
+                val_acc = self.evaluate(
+                    self.val_conditions, 
+                    f"epoch_{epoch}", 
+                    "val"
+                )
                 print(f"Validation Accuracy: {val_acc:.4f}")
                 
                 if val_acc > best_acc:
